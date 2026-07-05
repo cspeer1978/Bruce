@@ -40,7 +40,7 @@ enum tftFuncs : uint8_t { // DO NOT CHANGE THE ORDER, ADD NEW FUNCTIONS TO THE E
 #define MAX_LOG_IMAGES 1
 #define MAX_LOG_IMG_PATH 512
 #else
-#define MAX_LOG_ENTRIES 40
+#define MAX_LOG_ENTRIES 96
 #define MAX_LOG_SIZE 64
 #define MAX_LOG_IMAGES 1
 #define MAX_LOG_IMG_PATH 256

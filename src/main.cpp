@@ -1,6 +1,6 @@
 #include "core/main_menu.h"
 #include <globals.h>
-
+#include "modules/espnow_mirror/espnow_mirror.h"
 #include "core/powerSave.h"
 #include "core/serial_commands/cli.h"
 #include "core/utils.h"
@@ -503,7 +503,8 @@ void setup() {
     //  start a task to handle serial commands while the webui is running
     startSerialCommandsHandlerTask(true);
 
-    wakeUpScreen();
+    espnowMirrorBegin();
+
     if (bruceConfig.startupApp != "" && !startupApp.startApp(bruceConfig.startupApp)) {
         bruceConfig.setStartupApp("");
     }
