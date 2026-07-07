@@ -28,7 +28,7 @@ static uint8_t RX_MAC[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 static const uint8_t  CH        = 1;
 static const uint8_t  MSG       = 0xE5;   // must match receiver
 static const int      CHUNK     = 240;    // <= 250 - 4 header bytes
-static const uint32_t PERIOD_MS = 150;    // ~6-7 fps; plenty for static UI
+static const uint32_t PERIOD_MS = 60;     // ~16 fps poll; snappy navigation
 static const size_t   BIN_MAX   = 9216;
 
 static TaskHandle_t s_task = nullptr;
@@ -45,6 +45,36 @@ static void onSent(const uint8_t*, esp_now_send_status_t st) {
   if (st == ESP_NOW_SEND_SUCCESS) s_okCount++; else s_failCount++;
 }
 
+// Re-assert ESP-NOW after a Wi-Fi state change. Bruce's "Turn Off WiFi"
+// deinitializes ESP-NOW entirely (sends fail with "esp now not init") and can
+// leave the radio on channel 0. So fully rebuild: revive the STA + channel,
+// then esp_now_init + re-register + re-add peer. Safe to call repeatedly.
+static void reassertPeer() {
+  uint8_t primaryCh = 0; wifi_second_chan_t sc;
+  esp_wifi_get_channel(&primaryCh, &sc);
+
+  // Make sure the radio is alive on a valid channel.
+  if (primaryCh == 0 || primaryCh > 13) {
+    WiFi.mode(WIFI_STA);
+    esp_wifi_start();
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+  }
+
+  // Rebuild ESP-NOW from scratch (deinit is a no-op / harmless if not inited).
+  esp_now_deinit();
+  if (esp_now_init() != ESP_OK) return;
+  esp_now_register_send_cb(onSent);
+
+  esp_now_peer_info_t p = {};
+  memcpy(p.peer_addr, RX_MAC, 6);
+  p.channel = 0;                 // home channel -> no mismatch
+  p.encrypt = false;
+  p.ifidx   = WIFI_IF_STA;
+  esp_now_add_peer(&p);
+}
+
 static void mirrorTask(void*) {
   static uint8_t bin[BIN_MAX];
   static uint8_t lastGood[BIN_MAX];
@@ -53,7 +83,9 @@ static void mirrorTask(void*) {
   uint8_t   seq = 0;
   uint32_t  beat = 0;
   uint32_t  lastSendMs = 0;
-  const uint32_t IDLE_RESEND_MS = 1000;   // idle keepalive cadence
+  size_t    lastSentSz = 0;
+  uint32_t  lastOk = 0, lastFail = 0, lastReassertMs = 0;
+  const uint32_t IDLE_RESEND_MS = 1000;   // true-idle keepalive cadence
 
   for (;;) {
     if (!s_run) break;
@@ -65,12 +97,19 @@ static void mirrorTask(void*) {
     size_t   srcSz = 0;
     uint32_t now = millis();
 
-    if (sz > 8 && sz <= BIN_MAX) {          // fresh content -> send immediately
+    if (sz > 8 && sz <= BIN_MAX) {
+      // We have real content. Cache it as last-good, and send it right away if
+      // it differs from what we last sent (navigation) OR enough time passed.
+      bool changed = (sz != lastSentSz) || (memcmp(bin, lastGood, sz) != 0);
       memcpy(lastGood, bin, sz);
       lastGoodSz = sz;
-      src = lastGood; srcSz = sz;
+      if (changed || (now - lastSendMs) >= IDLE_RESEND_MS) {
+        src = lastGood; srcSz = sz;
+      }
     } else if (lastGoodSz > 0 && (now - lastSendMs) >= IDLE_RESEND_MS) {
-      src = lastGood; srcSz = lastGoodSz;   // idle: resend last good ~1/sec only
+      // Log momentarily empty (e.g. just after fillScreen) or truly idle:
+      // resend last good so the receiver holds the correct screen.
+      src = lastGood; srcSz = lastGoodSz;
     }
 
     if (src && srcSz > 0) {
@@ -86,9 +125,27 @@ static void mirrorTask(void*) {
       }
       seq++;
       lastSendMs = now;
+      lastSentSz = srcSz;
     }
 
     if (++beat % 13 == 0) s_lastSz = sz;
+
+    // Self-heal after Wi-Fi state changes. Bruce's Turn-Off-WiFi deinitializes
+    // ESP-NOW and can leave the radio on channel 0. Detect the dead state
+    // (bad channel, sends failing, or ok count not advancing) and fully rebuild
+    // ESP-NOW until sends succeed again.
+    uint32_t nowc = millis();
+    if (nowc - lastReassertMs > 1000) {
+      uint8_t ch=0; wifi_second_chan_t sc2; esp_wifi_get_channel(&ch,&sc2);
+      bool okStalled   = (s_okCount == lastOk);
+      bool failGrowing = (s_failCount != lastFail);
+      bool weAreSending = (lastSendMs != 0 && nowc - lastSendMs < 3000);
+      bool badChannel  = (ch == 0 || ch > 13);
+      if (badChannel || (weAreSending && (failGrowing || okStalled))) {
+        reassertPeer();
+      }
+      lastOk = s_okCount; lastFail = s_failCount; lastReassertMs = nowc;
+    }
 
     vTaskDelay(pdMS_TO_TICKS(PERIOD_MS));
   }
